@@ -1,7 +1,7 @@
 #target illustrator
 
 /*
-  shibori-hasen.jsx  v0.1
+  shibori-hasen.jsx  v0.2.0
   Illustrator JSX / ScriptUI modal dialog 版
   対応: Illustrator 30.x（macOS）
 
@@ -9,6 +9,9 @@
   - モーダルdialogでパラメータ設定 → OKで一括変換
   - palette版で発生した macOS フォーカス問題を回避するためdialog方式
   - ライブプレビューは廃止。OK押下後に結果が表示される
+  - 角あり閉パスでは、各頂点の直後を dash 開始、直前を gap として配置する
+  - corner 判定はアンカー位置の折れ線角度ではなく、入出接線の角度差で行う
+  - dash 同士が詰まりすぎないよう、内部の最小可視 gap を使って本数を選定する
 
   使い方:
     1. 破線化したいパスを選択
@@ -32,7 +35,9 @@
     var CONFIG = {
         targetDashMm: 7.0,
         targetGapMm: 2.0,
-        unitToMm: 3.5278,
+        // Illustrator の DOM 座標は常に point 単位（ルーラー設定によらず固定）。
+        // 1pt = 25.4mm / 72 ≒ 0.35278mm。UI からは編集させない（環境非依存の定数）。
+        unitToMm: 0.35278,
         roundCapCorrection: true,
         useRoundCap: true,
 
@@ -42,8 +47,12 @@
         useAnchorCornerDetection: true,
         anchorCornerAngle: 25,
         skipDashAcrossAnchorCorner: true,
+        minVisibleGapMm: 1.2,
+        minVisibleGapRatio: 0.8,
 
-        centerDashInPath: true,
+        // 閉じたパスかつアンカー角が一切ない場合のみ両端に半gapマージンを置き、
+        // wraparound での dash 連結を防ぐ。アンカー角を持つセグメントでは
+        // 境界（=頂点）に dash を接触させる。UI には露出しない内部定数。
         straightDash: true,
 
         hideOriginal: true,
@@ -68,7 +77,6 @@
     addTitle(win, "基本設定");
     var dashCtl = addSliderRow(win, "破線長 mm", CONFIG.targetDashMm, 1, 20, 2);
     var gapCtl = addSliderRow(win, "間隔 mm", CONFIG.targetGapMm, 0.1, 10, 2);
-    var unitCtl = addNumberRow(win, "1 unit = mm", CONFIG.unitToMm, 4);
     var minCtl = addSliderRow(win, "minDash unit", CONFIG.minDashLength, 0.05, 2.0, 2);
 
     addTitle(win, "角処理");
@@ -83,8 +91,6 @@
     roundCapChk.value = CONFIG.useRoundCap;
     var roundCorrectionChk = win.add("checkbox", undefined, "丸端補正を使う");
     roundCorrectionChk.value = CONFIG.roundCapCorrection;
-    var centerChk = win.add("checkbox", undefined, "各パス内で破線を中央寄せする");
-    centerChk.value = CONFIG.centerDashInPath;
     var hideOriginalChk = win.add("checkbox", undefined, "確定時に元線を非表示にする");
     hideOriginalChk.value = CONFIG.hideOriginal;
 
@@ -139,19 +145,16 @@
     function readUIIntoConfig() {
         CONFIG.targetDashMm = parseFloatSafe(dashCtl.input.text, CONFIG.targetDashMm);
         CONFIG.targetGapMm = parseFloatSafe(gapCtl.input.text, CONFIG.targetGapMm);
-        CONFIG.unitToMm = parseFloatSafe(unitCtl.input.text, CONFIG.unitToMm);
         CONFIG.minDashLength = parseFloatSafe(minCtl.input.text, CONFIG.minDashLength);
         CONFIG.anchorCornerAngle = parseFloatSafe(anchorAngleCtl.input.text, CONFIG.anchorCornerAngle);
         CONFIG.useAnchorCornerDetection = useAnchorChk.value;
         CONFIG.skipDashAcrossAnchorCorner = skipCornerChk.value;
         CONFIG.useRoundCap = roundCapChk.value;
         CONFIG.roundCapCorrection = roundCorrectionChk.value;
-        CONFIG.centerDashInPath = centerChk.value;
         CONFIG.hideOriginal = hideOriginalChk.value;
 
         if (CONFIG.targetDashMm <= 0) CONFIG.targetDashMm = 7.0;
         if (CONFIG.targetGapMm < 0) CONFIG.targetGapMm = 2.0;
-        if (CONFIG.unitToMm <= 0) CONFIG.unitToMm = 3.5278;
         if (CONFIG.minDashLength < 0.01) CONFIG.minDashLength = 0.01;
         if (CONFIG.sampleStep <= 0) CONFIG.sampleStep = 0.08;
     }
@@ -282,21 +285,26 @@
         computeArcLength(sampled);
         var totalLength = sampled[sampled.length - 1].s;
         if (totalLength < CONFIG.minDashLength) { report.skipped++; return; }
-
-        var anchorCorners = [];
+        var corners = [];
         if (CONFIG.useAnchorCornerDetection) {
-            anchorCorners = detectAnchorCorners(pathItem, sampled);
+            corners = detectAnchorCorners(pathItem, sampled);
         }
 
-        // 角でサブセグメントに分割。各セグメント内で centerDashInPath が
-        // 独立に効くので、角の前後にも dash がきれいに収まる。
-        // skipDashAcrossAnchorCorner OFF か corners が無ければ全長1セグメント。
-        var segments = buildSegments(anchorCorners, totalLength);
+        var segments = [];
+        if (corners.length > 0) {
+            if (pathItem.closed) {
+                segments = buildClosedCornerSegments(corners, totalLength);
+            } else if (CONFIG.skipDashAcrossAnchorCorner) {
+                segments = buildOpenCornerSegments(corners, totalLength);
+            }
+        }
+        if (segments.length === 0) {
+            segments.push({ start: 0, end: totalLength, mode: pathItem.closed ? "loop" : "open" });
+        }
 
         var before = report.created;
-        for (var si = 0; si < segments.length; si++) {
-            // 角はセグメント境界に置かれるため、内部の corner skip は不要
-            drawDashedSegment(pathItem, sampled, segments[si], group, report);
+        for (var i = 0; i < segments.length; i++) {
+            drawDashedSegment(pathItem, sampled, segments[i], group, report, totalLength);
         }
 
         if (report.created > before) {
@@ -306,29 +314,7 @@
         }
     }
 
-    function buildSegments(anchorCorners, totalLength) {
-        if (!CONFIG.skipDashAcrossAnchorCorner ||
-            !anchorCorners || anchorCorners.length === 0) {
-            return [{ start: 0, end: totalLength }];
-        }
-        var sorted = anchorCorners.slice().sort(function (a, b) { return a.s - b.s; });
-        var segments = [];
-        var prev = 0;
-        var EPS = 0.0001;
-        for (var i = 0; i < sorted.length; i++) {
-            var s = sorted[i].s;
-            if (s > prev + EPS && s < totalLength - EPS) {
-                segments.push({ start: prev, end: s });
-                prev = s;
-            }
-        }
-        if (totalLength - prev > EPS) {
-            segments.push({ start: prev, end: totalLength });
-        }
-        return segments;
-    }
-
-    function drawDashedSegment(originalPath, sampled, segment, group, report) {
+    function drawDashedSegment(originalPath, sampled, segment, group, report, totalLength) {
         var segmentLength = segment.end - segment.start;
         if (segmentLength < CONFIG.minDashLength) return 0;
 
@@ -336,50 +322,89 @@
         var gapLength = getEffectiveGapLength(originalPath);
         if (dashLength <= 0) return 0;
 
-        // 頂点（セグメント両端）を基準に dash を配置：
-        //   dashLength は固定、gapLength を伸縮させてセグメント長に整合させる。
-        //   centerDashInPath ON: 両端に adjGap/2 のマージンを置く（隣接セグメント
-        //     のマージンと合わさって完全な gap になり、角・閉パスwraparound での
-        //     dash 連結を防ぐ）。
-        //   centerDashInPath OFF: 両端の dash がセグメント境界に接触する旧挙動。
+        // 半gapマージン方式（全セグメント共通）：
+        //   dashLength は固定、gapLength（adjustedGap）を伸縮させて長さ整合。
+        //   両端に adjGap/2 のマージンを置く → 隣接セグメントのマージンと合算
+        //   して完全な gap が成立し、角・閉パスwraparound で dash 連結を防ぐ。
+        //   ※「角の上に dash を乗せて綴じさせない」配置は直線 dash では実現
+        //     困難（隣接 dash が完全接触する=綴じる）のため、安全側として
+        //     角の手前で半 gap 引く方式に戻している。
         var sw = 0;
         try { sw = originalPath.strokeWidth || 0; } catch (eSw) {}
         // 視覚gapフロア: ユーザ指定の baseGap の半分、または絶対 0.5pt の大きい方。
         // round cap の場合 visible_gap = path_gap - sw なので、path 上の minGap は
-        // visible フロア + sw とする（gapLength に既に sw 補正が入っているため
-        // gapLength を使うと二重補正になり、正常な n が全て reject されてしまう）。
-        var baseGap = mmToUnit(CONFIG.targetGapMm);
-        var visibleGapFloor = Math.max(0.5, baseGap * 0.5);
-        var minGap = visibleGapFloor + (CONFIG.useRoundCap ? sw : 0);
-        var dashCount = chooseDashCount(segmentLength, dashLength, gapLength, minGap, CONFIG.centerDashInPath);
-        if (dashCount < 1) return 0;
-
+        // visible フロア + sw とする。
+        var minGap = getMinimumGapLength(sw);
         var adjustedGap;
+        var dashCount;
+        var step;
+        var s;
         var sideMargin;
-        if (dashCount === 1) {
-            adjustedGap = 0;
-            sideMargin = CONFIG.centerDashInPath
-                ? Math.max(0, (segmentLength - dashLength) / 2)
-                : 0;
-        } else if (CONFIG.centerDashInPath) {
-            // 半gapマージン方式：n*(dashLength + adjGap) = segmentLength
-            var slot = segmentLength / dashCount;
-            adjustedGap = slot - dashLength;
-            if (adjustedGap < 0) adjustedGap = 0;
-            sideMargin = adjustedGap / 2;
+
+        if (segment.mode === "loop") {
+            dashCount = chooseDashCount(segmentLength, dashLength, gapLength, minGap, true);
+            if (dashCount < 1) return 0;
+
+            if (dashCount === 1) {
+                adjustedGap = 0;
+                sideMargin = Math.max(0, (segmentLength - dashLength) / 2);
+            } else {
+                var slot = segmentLength / dashCount;
+                adjustedGap = slot - dashLength;
+                if (adjustedGap < 0) adjustedGap = 0;
+                sideMargin = adjustedGap / 2;
+            }
+            s = segment.start + sideMargin;
+            step = dashLength + adjustedGap;
         } else {
-            // 旧挙動：両端の dash がセグメント境界に接する
-            adjustedGap = (segmentLength - dashCount * dashLength) / (dashCount - 1);
-            if (adjustedGap < 0) adjustedGap = 0;
-            sideMargin = 0;
+            dashCount = chooseDashCountForMode(segmentLength, dashLength, gapLength, minGap, segment.mode);
+            if (dashCount < 1) {
+                if (startsWith(segment.mode, "dash_") && segmentLength >= dashLength) {
+                    var fp0 = interpolateAtS(sampled, wrapS(segment.start, totalLength));
+                    var fp1 = interpolateAtS(sampled, wrapS(segment.start + dashLength, totalLength));
+                    if (fp0 && fp1) {
+                        createDashPath(originalPath, [fp0, fp1], group, report);
+                        return 1;
+                    }
+                }
+                return 0;
+            }
+
+            if (segment.mode === "gap_gap") {
+                adjustedGap = segmentLength / dashCount - dashLength;
+                s = segment.start + adjustedGap / 2;
+            } else if (segment.mode === "dash_dash") {
+                adjustedGap = (segmentLength - dashCount * dashLength) / (dashCount - 1);
+                s = segment.start;
+            } else if (segment.mode === "dash_gap") {
+                adjustedGap = (segmentLength - dashCount * dashLength) / dashCount;
+                s = segment.start;
+            } else if (segment.mode === "gap_dash") {
+                adjustedGap = (segmentLength - dashCount * dashLength) / (dashCount - 0.5);
+                s = segment.start + adjustedGap / 2;
+            } else {
+                if (dashCount === 1) {
+                    adjustedGap = 0;
+                    sideMargin = Math.max(0, (segmentLength - dashLength) / 2);
+                } else {
+                    adjustedGap = (segmentLength - dashCount * dashLength) / (dashCount - 1);
+                    sideMargin = Math.max(0, (segmentLength - (dashCount * dashLength + (dashCount - 1) * adjustedGap)) / 2);
+                }
+                s = segment.start + sideMargin;
+            }
+            step = dashLength + adjustedGap;
         }
 
         var createdCount = 0;
-        var s = segment.start + sideMargin;
-
         for (var i = 0; i < dashCount; i++) {
             var dashStart = s;
-            var dashEnd = Math.min(s + dashLength, segment.end);
+            var dashEnd = s + dashLength;
+            if (!originalPath.closed) {
+                dashEnd = Math.min(dashEnd, totalLength);
+            } else {
+                dashStart = wrapS(dashStart, totalLength);
+                dashEnd = wrapS(dashEnd, totalLength);
+            }
 
             if (dashEnd - dashStart >= CONFIG.minDashLength) {
                 var p0 = interpolateAtS(sampled, dashStart);
@@ -394,16 +419,100 @@
         return createdCount;
     }
 
-    function chooseDashCount(segmentLength, dashLength, gapLength, minGap, centerMode) {
+    function buildClosedCornerSegments(corners, totalLength) {
+        if (corners.length < 2) {
+            return [{ start: 0, end: totalLength, mode: "loop" }];
+        }
+        var segments = [];
+        for (var i = 0; i < corners.length; i++) {
+            var start = corners[i].s;
+            var end = corners[(i + 1) % corners.length].s;
+            if (i === corners.length - 1) end += totalLength;
+            segments.push({
+                start: start,
+                end: end,
+                mode: "dash_gap"
+            });
+        }
+        return segments;
+    }
+
+    function buildOpenCornerSegments(corners, totalLength) {
+        var boundaries = [{ s: 0, isCorner: false }];
+        for (var i = 0; i < corners.length; i++) boundaries.push({ s: corners[i].s, isCorner: true });
+        boundaries.push({ s: totalLength, isCorner: false });
+
+        var segments = [];
+        for (i = 0; i < boundaries.length - 1; i++) {
+            var startBoundary = boundaries[i];
+            var endBoundary = boundaries[i + 1];
+            segments.push({
+                start: startBoundary.s,
+                end: endBoundary.s,
+                mode: (startBoundary.isCorner && endBoundary.isCorner) ? "gap_gap" : "open"
+            });
+        }
+        return segments;
+    }
+
+    function chooseDashCountForMode(segmentLength, dashLength, gapLength, minGap, mode) {
+        var ideal;
+        if (mode === "dash_dash") {
+            ideal = (segmentLength + gapLength) / (dashLength + gapLength);
+        } else if (mode === "dash_gap") {
+            ideal = segmentLength / (dashLength + gapLength);
+        } else if (mode === "gap_dash") {
+            ideal = (segmentLength + gapLength * 0.5) / (dashLength + gapLength);
+        } else {
+            ideal = segmentLength / (dashLength + gapLength);
+        }
+
+        var floorN = Math.max(1, Math.floor(ideal));
+        var ceilN = Math.max(1, Math.ceil(ideal));
+        var candidates = (floorN === ceilN) ? [floorN] : [floorN, ceilN];
+        var bestN = -1;
+        var bestDelta = Infinity;
+
+        for (var i = 0; i < candidates.length; i++) {
+            var n = candidates[i];
+            if (n * dashLength > segmentLength + 0.0001) continue;
+
+            var gap;
+            if (mode === "dash_dash") {
+                if (n === 1) continue;
+                gap = (segmentLength - n * dashLength) / (n - 1);
+            } else if (mode === "gap_gap") {
+                gap = segmentLength / n - dashLength;
+            } else if (mode === "dash_gap") {
+                gap = (segmentLength - n * dashLength) / n;
+            } else if (mode === "gap_dash") {
+                gap = (segmentLength - n * dashLength) / (n - 0.5);
+            } else {
+                gap = (n === 1)
+                    ? (segmentLength - dashLength)
+                    : (segmentLength - n * dashLength) / (n - 1);
+            }
+            if (gap < minGap) continue;
+
+            var delta = Math.abs(gap - gapLength);
+            if (delta < bestDelta) {
+                bestDelta = delta;
+                bestN = n;
+            }
+        }
+        return bestN;
+    }
+
+    function chooseDashCount(segmentLength, dashLength, gapLength, minGap, isLoop) {
         // セグメントに dash を何本入れるか決める。
-        // centerMode=true: 両端に adjGap/2 マージン → n*(dash+gap)=L 想定で n を推定
-        // centerMode=false: 両端の dash が境界に接する → n*dash+(n-1)*gap=L 想定
+        // isLoop=true:  両端に adjGap/2 マージン → n*(dash+gap)=L 想定で n を推定
+        // isLoop=false: 両端の dash が境界に接する → n*dash+(n-1)*gap=L 想定
         // 候補のうち target gap に最も近く、minGap を満たすものを採用。
         if (segmentLength < dashLength + 0.0001) {
             return segmentLength >= CONFIG.minDashLength ? 1 : 0;
         }
         var patternLength = dashLength + gapLength;
-        var ideal = centerMode
+        var ideal = isLoop
             ? segmentLength / patternLength
             : (segmentLength + gapLength) / patternLength;
         var floorN = Math.max(1, Math.floor(ideal));
@@ -420,7 +529,7 @@
             if (n === 1) {
                 // 1本配置: gap適合度は計測不能。2本目を入れたら minGap 未満に
                 // なる、または2本入らない場合のみ採用。
-                var twoSlotGap = centerMode
+                var twoSlotGap = isLoop
                     ? segmentLength / 2 - dashLength
                     : (segmentLength - 2 * dashLength);
                 if (twoSlotGap < minGap || 2 * dashLength > segmentLength + 0.0001) {
@@ -428,7 +537,7 @@
                     if (delta1 < bestDelta) { bestDelta = delta1; bestN = 1; }
                 }
             } else {
-                var g = centerMode
+                var g = isLoop
                     ? segmentLength / n - dashLength
                     : (segmentLength - n * dashLength) / (n - 1);
                 if (g < minGap) continue; // dash が連結して見える
@@ -519,16 +628,18 @@
             if (prevIndex < 0) prevIndex = count - 1;
             if (nextIndex >= count) nextIndex = 0;
 
-            var prev = toPoint(pps[prevIndex].anchor);
-            var curr = toPoint(pps[i].anchor);
-            var next = toPoint(pps[nextIndex].anchor);
+            var prevAnchor = toPoint(pps[prevIndex].anchor);
+            var currAnchor = toPoint(pps[i].anchor);
+            var nextAnchor = toPoint(pps[nextIndex].anchor);
+            var leftHandle = toPoint(pps[i].leftDirection);
+            var rightHandle = toPoint(pps[i].rightDirection);
 
-            var v1 = { x: curr.x - prev.x, y: curr.y - prev.y };
-            var v2 = { x: next.x - curr.x, y: next.y - curr.y };
-            var angle = angleBetween(v1, v2);
+            var incoming = tangentFromLeft(prevAnchor, leftHandle, currAnchor);
+            var outgoing = tangentFromRight(currAnchor, rightHandle, nextAnchor);
+            var angle = angleBetween(incoming, outgoing);
 
             if (angle >= CONFIG.anchorCornerAngle) {
-                var nearest = findNearestSamplePoint(sampled, curr);
+                var nearest = findNearestSamplePoint(sampled, currAnchor);
                 corners.push({ s: nearest.s, type: "hard", angle: angle, source: "anchor" });
             }
         }
@@ -597,6 +708,31 @@
         return nearest;
     }
 
+    function tangentFromLeft(prevAnchor, leftHandle, anchor) {
+        if (distance(leftHandle, anchor) > 0.0001) {
+            return { x: anchor.x - leftHandle.x, y: anchor.y - leftHandle.y };
+        }
+        return { x: anchor.x - prevAnchor.x, y: anchor.y - prevAnchor.y };
+    }
+
+    function tangentFromRight(anchor, rightHandle, nextAnchor) {
+        if (distance(rightHandle, anchor) > 0.0001) {
+            return { x: rightHandle.x - anchor.x, y: rightHandle.y - anchor.y };
+        }
+        return { x: nextAnchor.x - anchor.x, y: nextAnchor.y - anchor.y };
+    }
+
+    function wrapS(value, totalLength) {
+        if (totalLength === 0) return 0;
+        var wrapped = value % totalLength;
+        if (wrapped < 0) wrapped += totalLength;
+        return wrapped;
+    }
+
+    function startsWith(text, prefix) {
+        return String(text).indexOf(prefix) === 0;
+    }
+
     function mmToUnit(mm) {
         return mm / CONFIG.unitToMm;
     }
@@ -615,6 +751,15 @@
             return baseGap + originalPath.strokeWidth;
         }
         return baseGap;
+    }
+
+    function getMinimumGapLength(strokeWidth) {
+        var baseGap = mmToUnit(CONFIG.targetGapMm);
+        var minVisibleGap = Math.max(
+            mmToUnit(CONFIG.minVisibleGapMm),
+            baseGap * CONFIG.minVisibleGapRatio
+        );
+        return minVisibleGap + (CONFIG.useRoundCap ? strokeWidth : 0);
     }
 
     function toPoint(arr) { return { x: arr[0], y: arr[1] }; }
