@@ -1,6 +1,6 @@
 # shibori-hasen
 
-選択したパスを「絞り破線」風の dash 群に変換する Adobe Illustrator 用 ExtendScript（.jsx）です。
+選択したパスを有松・鳴海絞の下絵で使用される「破線」風の dash 群に変換する Adobe Illustrator 用 ExtendScript（.jsx）です。
 
 頂点（アンカーコーナー）を基準に dash の間隔を自動調整するため、角や閉パスの折り返しで dash が連結したり消えたりせず、視覚的に整った破線が得られます。
 
@@ -12,7 +12,6 @@
 
 - Adobe Illustrator 30.x（macOS で動作確認）
   - ScriptUI（ExtendScript）が動く環境であれば 27.x 以降でも概ね動作する見込みですが、未検証です。
-- 入力は `PathItem` / `CompoundPathItem` / `GroupItem`（再帰的に処理）
 - ガイド・クリッピングパスはスキップされます
 
 ---
@@ -44,17 +43,6 @@
 | 線端を丸くする               | round cap（既定 ON）                                          |
 | 丸端補正を使う               | round cap で見た目の dash/gap がユーザ指定値と一致するよう補正 |
 | 確定時に元線を非表示にする   | OK 後に元線を hidden 化（OFF にすれば残ります）               |
-
----
-
-## アルゴリズムの要点
-
-- パスを微小ステップでサンプリングし、累積弧長 `s` を計算
-- アンカー角検出は、アンカー位置の折れ線角度ではなく **入出接線の角度差** で行う（ベジェの両側ハンドルを考慮した正確な corner 判定）
-- **角あり閉パス**では、各頂点の **直後を dash 開始、直前を gap** として配置 → 角は必ず gap になり、辺ごとに独立した均等分割が得られる
-- **角なし閉パス（円など）**は半 gap マージン方式で wraparound 連結を防ぐ
-- 各セグメントで dash 数 `n` を `n*(dash + gap) ≒ L` から決定し、最小可視 gap（`minVisibleGapMm` / `minVisibleGapRatio`）を満たす範囲で目標値に近い候補を採用
-- `minGap` は `視覚gapフロア + (round cap時 strokeWidth)` で算出し、round cap で cap が食い込んでも視覚的な隙間が必ず残るよう保証
 
 ---
 
