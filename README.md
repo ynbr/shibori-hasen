@@ -1,3 +1,5 @@
+![sample](image-sample.png)
+
 # shibori-hasen
 
 選択したパスを有松・鳴海絞の下絵で使用される「破線」風の dash 群に変換する Adobe Illustrator 用 ExtendScript（.jsx）です。
