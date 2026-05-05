@@ -1,7 +1,7 @@
 #target illustrator
 
 /*
-  shibori-hasen.jsx  v0.2.0
+  shibori-hasen.jsx  v0.3.0
   Illustrator JSX / ScriptUI modal dialog 版
   対応: Illustrator 30.x（macOS）
 
@@ -12,6 +12,7 @@
   - 角あり閉パスでは、各頂点の直後を dash 開始、直前を gap として配置する
   - corner 判定はアンカー位置の折れ線角度ではなく、入出接線の角度差で行う
   - dash 同士が詰まりすぎないよう、内部の最小可視 gap を使って本数を選定する
+  - A案: interpolateAtS の探索を二分探索化して、dash 位置計算の走査回数を減らす
 
   使い方:
     1. 破線化したいパスを選択
@@ -58,7 +59,7 @@
         hideOriginal: true,
         deleteOriginal: false,
 
-        finalGroupName: "shibori-hasen-dashes",
+        finalGroupName: "shibori-hasen-dashes-a",
         showReport: true
     };
 
@@ -68,7 +69,7 @@
     }
 
     // -------- UI: modal dialog --------
-    var win = new Window("dialog", "絞り破線ジェネレーター");
+    var win = new Window("dialog", "絞り破線ジェネレーター A");
     win.orientation = "column";
     win.alignChildren = "fill";
     win.spacing = 8;
@@ -413,10 +414,34 @@
                     createDashPath(originalPath, [p0, p1], group, report);
                     createdCount++;
                 }
+            } else if (originalPath.closed && dashStart > dashEnd) {
+                createdCount += createWrappedDashPaths(originalPath, sampled, dashStart, dashEnd, totalLength, group, report);
             }
             s += dashLength + adjustedGap;
         }
         return createdCount;
+    }
+
+    function createWrappedDashPaths(originalPath, sampled, dashStart, dashEnd, totalLength, group, report) {
+        var created = 0;
+        var firstLength = totalLength - dashStart;
+        if (firstLength >= CONFIG.minDashLength) {
+            var p0 = interpolateAtS(sampled, dashStart);
+            var p1 = interpolateAtS(sampled, totalLength);
+            if (p0 && p1) {
+                createDashPath(originalPath, [p0, p1], group, report);
+                created++;
+            }
+        }
+        if (dashEnd >= CONFIG.minDashLength) {
+            var p2 = interpolateAtS(sampled, 0);
+            var p3 = interpolateAtS(sampled, dashEnd);
+            if (p2 && p3) {
+                createDashPath(originalPath, [p2, p3], group, report);
+                created++;
+            }
+        }
+        return created;
     }
 
     function buildClosedCornerSegments(corners, totalLength) {
@@ -648,17 +673,24 @@
 
     function interpolateAtS(points, targetS) {
         if (targetS <= 0) return { x: points[0].x, y: points[0].y };
-        for (var i = 1; i < points.length; i++) {
-            var p0 = points[i - 1];
-            var p1 = points[i];
-            if (p0.s <= targetS && targetS <= p1.s) {
-                var d = p1.s - p0.s;
-                var t = d === 0 ? 0 : (targetS - p0.s) / d;
-                return { x: lerp(p0.x, p1.x, t), y: lerp(p0.y, p1.y, t) };
+        var hi = points.length - 1;
+        var lo = 0;
+        if (targetS >= points[hi].s) {
+            return { x: points[hi].x, y: points[hi].y };
+        }
+        while (lo + 1 < hi) {
+            var mid = Math.floor((lo + hi) / 2);
+            if (points[mid].s < targetS) {
+                lo = mid;
+            } else {
+                hi = mid;
             }
         }
-        var last = points[points.length - 1];
-        return { x: last.x, y: last.y };
+        var p0 = points[lo];
+        var p1 = points[hi];
+        var d = p1.s - p0.s;
+        var t = d === 0 ? 0 : (targetS - p0.s) / d;
+        return { x: lerp(p0.x, p1.x, t), y: lerp(p0.y, p1.y, t) };
     }
 
     function computeArcLength(points) {
